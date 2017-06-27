@@ -14,25 +14,27 @@ extern crate num_cpus;
 #[macro_use]
 extern crate serde_derive;
 extern crate tokio_core;
+extern crate tokio_process;
 #[cfg(test)]
 extern crate tempdir;
 
 mod errors;
 
-use std::sync::{Mutex, Arc};
-use std::path::{PathBuf, Path};
-use std::process::{Command, Child, ExitStatus};
+use std::path::{PathBuf};
+use std::process::{Command, ExitStatus};
 use std::collections::HashMap;
 
 use errors::*;
 
-use futures::{Poll, Async, Future, IntoFuture};
-use futures::future::{AndThen, JoinAll, BoxFuture, join_all, Shared, SharedError, SharedItem};
+use futures::{Poll, Async, Future};
+use futures::future::{join_all, Shared, err};
 use futures::stream::{Stream, Collect, Take};
 use futures::sink::Sink;
 // use chan::{Sender, Receiver};
-use multiqueue::{MPMCFutSender, MPMCFutReceiver, mpmc_fut_queue};
+use multiqueue::{MPMCFutSender, MPMCFutReceiver};
 use docopt::Docopt;
+
+use tokio_process::{CommandExt};
 
 #[cfg_attr(rustfmt, rustfmt_ignore)]
 const USAGE: &str = "
@@ -49,8 +51,8 @@ Options:
     --threads <t>   Number of threads available. Defaults to the number of CPUs available.
 ";
 
-type Sender<T> = Arc<Mutex<MPMCFutSender<T>>>;
-type Receiver<T> = Arc<Mutex<MPMCFutReceiver<T>>>;
+type Sender<T> = MPMCFutSender<T>;
+type Receiver<T> = MPMCFutReceiver<T>;
 
 #[derive(Deserialize, Debug)]
 struct Args {
@@ -118,7 +120,7 @@ impl CommandLine {
 /// dependencies are satisfied.
 #[derive(Clone)]
 struct Task {
-    deps: Vec<Shared<BoxFuture<ExitStatus, Error>>>,
+    deps: Vec<TaskLifecycle>,
     ident: Option<String>,
     tpl: CommandTemplate,
     logdir: PathBuf,
@@ -128,7 +130,7 @@ struct Task {
 }
 
 impl Task {
-    pub fn new(deps: Vec<Shared<BoxFuture<ExitStatus, Error>>>, tpl: CommandTemplate, recv: Receiver<Token>, send: Sender<Token>, threads: usize, logdir: Option<String>) -> Self {
+    pub fn new(deps: Vec<TaskLifecycle>, tpl: CommandTemplate, recv: Receiver<Token>, send: Sender<Token>, threads: usize, logdir: Option<String>) -> Self {
         Task { deps, tpl, threads, send, recv, logdir: logdir.map(|p| PathBuf::from(p)).unwrap_or_else(|| PathBuf::from("logs")), ident: None }
     }
 
@@ -169,16 +171,15 @@ impl Task {
 struct RunnableTask {
     cmd: CommandLine,
     send: Sender<Token>,
-    recv: Receiver<Token>,
-    internal: Collect<Take<MPMCFutReceiver<Token>>>,
+    internal: Collect<Take<Receiver<Token>>>,
     tokens_needed: usize,
 }
 
 impl RunnableTask {
     pub fn new(cmd: CommandLine, send: Sender<Token>, recv: Receiver<Token>, tokens_needed: usize) -> Self {
-        let internal = recv.lock().unwrap().take(tokens_needed as u64).collect(); 
+        let internal = recv.take(tokens_needed as u64).collect();
         RunnableTask {
-            cmd, send, tokens_needed, recv, internal
+            cmd, send, tokens_needed, internal
         }
     }
 }
@@ -187,7 +188,6 @@ impl Future for RunnableTask {
     type Item = (CommandLine, usize, Sender<Token>);
     type Error = Error;
 
-    // TODO: some way to trigger re-poll after a token is added back to the channel
     fn poll(&mut self) -> Poll<Self::Item, Self::Error> {
         match self.internal.poll() {
             Ok(Async::Ready(_)) => Ok(Async::Ready((self.cmd.clone(), self.tokens_needed, self.send.clone()))),
@@ -197,56 +197,35 @@ impl Future for RunnableTask {
     }
 }
 
-struct RunningTask {
-    cmd: CommandLine,
-    process: Child,
-    send: Sender<Token>,
-    tokens: usize,
-}
+type TaskLifecycle = Shared<Box<Future<Item=ExitStatus, Error=Error>>>;
 
-impl RunningTask {
-    pub fn run(cmd: CommandLine, send: Sender<Token>, tokens: usize) -> Result<Self> {
-        println!("running {:?}", cmd);
-        let process = Command::new(cmd.program())
-            .args(cmd.args())
-            .spawn()?;
-
-        Ok(RunningTask { cmd, send, tokens, process })
-    }
-}
-
-impl Future for RunningTask {
-    type Item = (ExitStatus, usize, Sender<Token>);
-    type Error = Error;
-
-    fn poll(&mut self) -> Poll<Self::Item, Self::Error> {
-        match self.process.try_wait() {
-            Ok(Some(status)) => Ok(Async::Ready((status, self.tokens, self.send.clone()))),
-            Ok(None) => Ok(Async::NotReady),
-            Err(e) => Err(e.into()),
-        }
-    }
-}
-
-fn task_life(t: Task) -> Shared<BoxFuture<ExitStatus, Error>>
+fn task_life(handle: tokio_core::reactor::Handle, t: Task) -> TaskLifecycle
   {
-    join_all(t.deps.clone())
-        .map_err(move |se| *se)
-        .and_then(move |_deps| RunnableTask::new(t.command().unwrap(), t.send, t.recv, t.threads))
-        .and_then(|(cmd, tokens, send)| RunningTask::run(cmd, send, tokens).unwrap())
-        .and_then(move |(status, tokens, send)| {
-            send.lock().unwrap().send_all(futures::stream::repeat(()).take(tokens as u64)).then(move |_| futures::future::ok(status))
-        })
-        .boxed()
-        .shared()
-}
+      let b: Box<Future<Item=ExitStatus, Error=Error>> = 
+          Box::new(join_all(t.deps.clone())
+                   .map_err(|_err| ErrorKind::DependencyError.into())
+                   .and_then(move |_deps| {
+                       RunnableTask::new(t.command().unwrap(), t.send, t.recv, t.threads)
+                   })
+                   .and_then(move |(cmd, tokens, send)| {
+                       let cmd = Command::new(cmd.program()).args(cmd.args())
+                                      .spawn_async(&handle);
 
-/// Build a future tree from a list of tasks.
-///
-/// It is assumed that all the dependencies of a task occur before it in the task list (which, of
-/// course, implies that there are no circular dependencies)
-fn build(tasks: &[Task]) -> BoxFuture<Vec<SharedItem<ExitStatus>>, SharedError<Error>> {
-    join_all(tasks.iter().map(|&t| task_life(t)).collect::<Vec<_>>()).boxed()
+                       if let Err(e) = cmd {
+                           err(e.into()).boxed()
+                       } else {
+                           cmd.unwrap().map(move |status| (status, tokens, send))
+                               .map_err(|err| err.into()).boxed()
+                       }
+                   })
+                   .and_then(|(status, tokens, send)| {
+                       send.send_all(futures::stream::repeat(()).take(tokens as u64))
+                           .map(move |_| { 
+                               status})
+                           .map_err(|_| ErrorKind::TokenStreamError.into())
+                   }));
+
+      b.shared()
 }
 
 fn main() {
@@ -261,7 +240,6 @@ fn main() {
 mod test {
     use super::*;
     use super::CommandPlace::*;
-    use std::sync::Arc;
     use tempdir::TempDir;
     use tokio_core::reactor::Core;
 
@@ -273,20 +251,33 @@ mod test {
         let logdir = TempDir::new("waluigid_test").unwrap();
         let n = 10;
 
-        let (send, recv) = chan::sync(2);
+        let (send, recv) = multiqueue::mpmc_fut_queue(10);
+        send.clone().send_all(futures::stream::repeat(()).take(8)).poll().unwrap();
 
-        let mut tasks: Vec<TaskRef> = Vec::with_capacity(n);
+        let mut core = Core::new().unwrap();
+        let mut tasks: Vec<TaskLifecycle> = Vec::with_capacity(n);
         for i in 1..(n+1) {
             let divisors = (1..i).filter(|&j| i % j == 0).map(|j| tasks[j-1].clone()).collect();
-            let tpl = CommandTemplate::new(vec![Fixed("echo".to_string()), Fixed(format!("{}", i))]);
-            tasks.push(TaskRef(Arc::new(Task::new(divisors, tpl, recv.clone(), send.clone(), 1, Some(logdir.path().to_str().unwrap().to_string())))));
+            let tpl = CommandTemplate::new(vec![Fixed("/usr/bin/time".to_string()), Fixed("-v".to_string()), 
+                                           Fixed("-o".to_string()), Fixed(logdir.path().join(format!("{}.log", i)).to_str().unwrap().to_string()), 
+                                           Fixed("true".to_string())]);
+            tasks.push(task_life(core.handle(), Task::new(divisors, tpl, recv.clone(), send.clone(), 1, Some(logdir.path().to_str().unwrap().to_string()))));
         }
 
-        let tree = build(&tasks);
-        let mut core = Core::new().unwrap();
-        core.run(tree).unwrap();
+        core.run(join_all(tasks)).unwrap();
 
-        assert!(tasks.iter().all(|t| t.complete()));
+        for i in 1..(n+1) {
+            let path = logdir.path().join(format!("{}.log", i));
+
+            assert!(path.exists());
+        }
+    }
+
+    #[test]
+    fn broadcast() {
+        let (send, recv) = multiqueue::broadcast_fut_queue(2);
+        send.send_all(futures::stream::repeat(()).take(2)).poll().unwrap();
+        recv.take(2).collect().poll().unwrap();
     }
 
 }
