@@ -26,9 +26,9 @@ use std::collections::HashMap;
 
 use errors::*;
 
-use futures::{Poll, Async, Future};
+use futures::Future;
 use futures::future::{join_all, Shared, err};
-use futures::stream::{Stream, Collect, Take};
+use futures::stream::{Stream};
 use futures::sink::Sink;
 // use chan::{Sender, Receiver};
 use multiqueue::{MPMCFutSender, MPMCFutReceiver};
@@ -168,35 +168,6 @@ impl Task {
     }
 }
 
-struct RunnableTask {
-    cmd: CommandLine,
-    send: Sender<Token>,
-    internal: Collect<Take<Receiver<Token>>>,
-    tokens_needed: usize,
-}
-
-impl RunnableTask {
-    pub fn new(cmd: CommandLine, send: Sender<Token>, recv: Receiver<Token>, tokens_needed: usize) -> Self {
-        let internal = recv.take(tokens_needed as u64).collect();
-        RunnableTask {
-            cmd, send, tokens_needed, internal
-        }
-    }
-}
-
-impl Future for RunnableTask {
-    type Item = (CommandLine, usize, Sender<Token>);
-    type Error = Error;
-
-    fn poll(&mut self) -> Poll<Self::Item, Self::Error> {
-        match self.internal.poll() {
-            Ok(Async::Ready(_)) => Ok(Async::Ready((self.cmd.clone(), self.tokens_needed, self.send.clone()))),
-            Ok(Async::NotReady) => Ok(Async::NotReady),
-            Err(()) => Err(ErrorKind::TokenStreamError.into()),
-        }
-    }
-}
-
 type TaskLifecycle = Shared<Box<Future<Item=ExitStatus, Error=Error>>>;
 
 fn task_life(handle: tokio_core::reactor::Handle, t: Task) -> TaskLifecycle
@@ -205,7 +176,11 @@ fn task_life(handle: tokio_core::reactor::Handle, t: Task) -> TaskLifecycle
           Box::new(join_all(t.deps.clone())
                    .map_err(|_err| ErrorKind::DependencyError.into())
                    .and_then(move |_deps| {
-                       RunnableTask::new(t.command().unwrap(), t.send, t.recv, t.threads)
+                       let cmd = t.command().unwrap();
+                       let Task { recv, threads, send, .. } = t;
+                       recv.take(threads as u64).collect()
+                           .map(move |_| (cmd, threads, send))
+                           .map_err(|_| ErrorKind::TokenStreamError.into())
                    })
                    .and_then(move |(cmd, tokens, send)| {
                        let cmd = Command::new(cmd.program()).args(cmd.args())
