@@ -1,7 +1,8 @@
 extern crate futures;
 // look at replacing this with multiqueue...
-#[macro_use]
-extern crate chan;
+// #[macro_use]
+// extern crate chan;
+extern crate multiqueue;
 #[macro_use]
 extern crate error_chain;
 #[macro_use]
@@ -18,7 +19,7 @@ extern crate tempdir;
 
 mod errors;
 
-use std::sync::Arc;
+use std::sync::{Mutex, Arc};
 use std::path::{PathBuf, Path};
 use std::process::{Command, Child, ExitStatus};
 use std::collections::HashMap;
@@ -26,8 +27,11 @@ use std::collections::HashMap;
 use errors::*;
 
 use futures::{Poll, Async, Future, IntoFuture};
-use futures::future::{AndThen, JoinAll, BoxFuture, join_all};
-use chan::{Sender, Receiver};
+use futures::future::{AndThen, JoinAll, BoxFuture, join_all, Shared, SharedError, SharedItem};
+use futures::stream::{Stream, Collect, Take};
+use futures::sink::Sink;
+// use chan::{Sender, Receiver};
+use multiqueue::{MPMCFutSender, MPMCFutReceiver, mpmc_fut_queue};
 use docopt::Docopt;
 
 #[cfg_attr(rustfmt, rustfmt_ignore)]
@@ -44,6 +48,9 @@ Options:
     --version       Show version information.
     --threads <t>   Number of threads available. Defaults to the number of CPUs available.
 ";
+
+type Sender<T> = Arc<Mutex<MPMCFutSender<T>>>;
+type Receiver<T> = Arc<Mutex<MPMCFutReceiver<T>>>;
 
 #[derive(Deserialize, Debug)]
 struct Args {
@@ -111,7 +118,7 @@ impl CommandLine {
 /// dependencies are satisfied.
 #[derive(Clone)]
 struct Task {
-    deps: Vec<TaskRef>,
+    deps: Vec<Shared<BoxFuture<ExitStatus, Error>>>,
     ident: Option<String>,
     tpl: CommandTemplate,
     logdir: PathBuf,
@@ -121,7 +128,7 @@ struct Task {
 }
 
 impl Task {
-    pub fn new(deps: Vec<TaskRef>, tpl: CommandTemplate, recv: Receiver<Token>, send: Sender<Token>, threads: usize, logdir: Option<String>) -> Self {
+    pub fn new(deps: Vec<Shared<BoxFuture<ExitStatus, Error>>>, tpl: CommandTemplate, recv: Receiver<Token>, send: Sender<Token>, threads: usize, logdir: Option<String>) -> Self {
         Task { deps, tpl, threads, send, recv, logdir: logdir.map(|p| PathBuf::from(p)).unwrap_or_else(|| PathBuf::from("logs")), ident: None }
     }
 
@@ -140,7 +147,10 @@ impl Task {
 
     /// Determines whether this task is ready to be run.
     pub fn ready(&self) -> bool {
-        self.deps.iter().all(|task| task.complete())
+        self.deps.iter().all(|task| match task.peek() {
+            Some(Ok(_)) => true,
+            _ => false
+        })
     }
 
     /// Produces the command to run this task.
@@ -156,27 +166,21 @@ impl Task {
     }
 }
 
-impl Future for Task {
-    type Item = (CommandLine, Sender<Token>, Receiver<Token>, usize);
-    type Error = Error;
-
-    fn poll(&mut self) -> Poll<Self::Item, Self::Error> {
-        println!("polling task");
-        if self.ready() {
-            println!("task ready");
-            Ok(Async::Ready((self.command().unwrap(), self.send.clone(), self.recv.clone(), self.threads)))
-        } else {
-            Ok(Async::NotReady)
-        }
-    }
-}
-
 struct RunnableTask {
     cmd: CommandLine,
     send: Sender<Token>,
     recv: Receiver<Token>,
-    tokens: usize,
+    internal: Collect<Take<MPMCFutReceiver<Token>>>,
     tokens_needed: usize,
+}
+
+impl RunnableTask {
+    pub fn new(cmd: CommandLine, send: Sender<Token>, recv: Receiver<Token>, tokens_needed: usize) -> Self {
+        let internal = recv.lock().unwrap().take(tokens_needed as u64).collect(); 
+        RunnableTask {
+            cmd, send, tokens_needed, recv, internal
+        }
+    }
 }
 
 impl Future for RunnableTask {
@@ -185,25 +189,10 @@ impl Future for RunnableTask {
 
     // TODO: some way to trigger re-poll after a token is added back to the channel
     fn poll(&mut self) -> Poll<Self::Item, Self::Error> {
-        println!("polling runnable");
-        let ref recv = self.recv;
-        while self.tokens < self.tokens_needed {
-            chan_select! {
-                default => { return Ok(Async::NotReady); },
-                recv.recv() => { self.tokens += 1 }
-            }
-            println!("received token. have {}, need {}", self.tokens, self.tokens_needed);
-        }
-        assert!(self.tokens >= self.tokens_needed);
-        Ok(Async::Ready((self.cmd.clone(), self.tokens, self.send.clone())))
-    }
-}
-
-impl Drop for RunnableTask {
-    // return all tokens to the channel if we get dropped
-    fn drop(&mut self) {
-        for _ in 0..self.tokens {
-            self.send.send(());
+        match self.internal.poll() {
+            Ok(Async::Ready(_)) => Ok(Async::Ready((self.cmd.clone(), self.tokens_needed, self.send.clone()))),
+            Ok(Async::NotReady) => Ok(Async::NotReady),
+            Err(()) => Err(ErrorKind::TokenStreamError.into()),
         }
     }
 }
@@ -239,59 +228,25 @@ impl Future for RunningTask {
     }
 }
 
-impl Drop for RunningTask {
-    // return all tokens to the channel if we get dropped
-    fn drop(&mut self) {
-        for _ in 0..self.tokens {
-            self.send.send(());
-        }
-    }
-}
-
-#[derive(Clone)]
-struct TaskRef(Arc<Task>);
-
-impl IntoFuture for TaskRef {
-    type Future = Task;
-    type Item = <Task as Future>::Item;
-    type Error = <Task as Future>::Error;
-
-    fn into_future(self) -> Self::Future {
-        (*self.0).clone()
-    }
-}
-
-impl ::std::ops::Deref for TaskRef {
-    type Target = Task;
-
-    fn deref(&self) -> &Self::Target {
-        &*self.0
-    }
-}
-
-fn task_life(t: TaskRef) -> BoxFuture<ExitStatus, Error>
+fn task_life(t: Task) -> Shared<BoxFuture<ExitStatus, Error>>
   {
     join_all(t.deps.clone())
-        .and_then(move |_deps| t)
-        .and_then(|(cmd, send, recv, tokens_needed)| RunnableTask {
-            cmd, send, recv, tokens_needed, tokens: 0,
-        })
-    .and_then(|(cmd, tokens, send)| RunningTask::run(cmd, send, tokens).unwrap())
-        .map(|(status, tokens, send)| {
-            for _ in 0..tokens {
-                send.send(());
-            }
-            status
+        .map_err(move |se| *se)
+        .and_then(move |_deps| RunnableTask::new(t.command().unwrap(), t.send, t.recv, t.threads))
+        .and_then(|(cmd, tokens, send)| RunningTask::run(cmd, send, tokens).unwrap())
+        .and_then(move |(status, tokens, send)| {
+            send.lock().unwrap().send_all(futures::stream::repeat(()).take(tokens as u64)).then(move |_| futures::future::ok(status))
         })
         .boxed()
+        .shared()
 }
 
 /// Build a future tree from a list of tasks.
 ///
 /// It is assumed that all the dependencies of a task occur before it in the task list (which, of
 /// course, implies that there are no circular dependencies)
-fn build(tasks: &[TaskRef]) -> BoxFuture<Vec<ExitStatus>, Error> {
-    join_all(tasks.iter().map(|t| task_life(t.clone())).collect::<Vec<_>>()).boxed()
+fn build(tasks: &[Task]) -> BoxFuture<Vec<SharedItem<ExitStatus>>, SharedError<Error>> {
+    join_all(tasks.iter().map(|&t| task_life(t)).collect::<Vec<_>>()).boxed()
 }
 
 fn main() {
@@ -300,7 +255,6 @@ fn main() {
         .unwrap_or_else(|e| e.exit());
 
     let num_tokens = args.flag_threads.unwrap_or_else(num_cpus::get);
-    let (send, recv) = chan::sync::<Token>(num_tokens);
 }
 
 #[cfg(test)]
