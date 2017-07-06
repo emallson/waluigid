@@ -31,5 +31,9 @@ error_chain!{
             description("Task is already complete when the future tried to run.")
             display("Task is already complete when the future tried to run.")
         }
+        NoSuchHole(s: String) {
+            description("No such hole exists to be filled.")
+            display("No such hole {} exists to be filled.", s)
+        }
     }
 }
