@@ -101,7 +101,7 @@ impl Task {
             let ident = self.determine_ident()?;
             self.ident = Some(ident.clone());
             let log_path = self.log_path()?;
-            self.tpl.fill_log(log_path);
+            self.tpl.fill_log(log_path)?;
             if self.tpl.full() {
                 Ok(())
             } else {

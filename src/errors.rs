@@ -5,6 +5,7 @@ error_chain!{
     foreign_links {
         Io(::std::io::Error);
         JSON(::serde_json::Error);
+        Nom(::nom::ErrorKind);
     }
     errors {
         NotReady {
@@ -34,6 +35,10 @@ error_chain!{
         NoSuchHole(s: String) {
             description("No such hole exists to be filled.")
             display("No such hole {} exists to be filled.", s)
+        }
+        CommandTemplateIncomplete(s: String) {
+            description("Command template could not be parsed.")
+            display("Command template could not be parsed: {}", s)
         }
     }
 }

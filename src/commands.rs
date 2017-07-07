@@ -197,13 +197,15 @@ named!(cmd_template<CommandTemplate>, map!(fold_many1!(ws!(alt!(hole | fixed)), 
     (i + 1, tpl)
 }), |(_, tpl)| tpl));
 
-// impl From<String> for CommandTemplate {
-    // fn from(s: String) -> Self {
-        // let res = cmd_template_parser(s.as_bytes());
-        // println!("{:?}", res);
-        // unimplemented!()
-    // }
-// }
+impl CommandTemplate {
+    pub fn from_string(s: &str) -> Result<Self> {
+        match cmd_template(s.as_bytes()) {
+            nom::IResult::Done(_, tpl) => Ok(tpl),
+            nom::IResult::Error(err) => Err(Error::from(err)),
+            nom::IResult::Incomplete(_) => Err(ErrorKind::CommandTemplateIncomplete(s.to_string()).into())
+        }
+    }
+}
 
 #[derive(Clone, Debug)]
 pub struct CommandLine {
@@ -241,7 +243,6 @@ mod test {
         let (_, res) = cmd_template(b"./target/release/interdict <graph:path> <epsilon> <delta> --log <log:path> --threads <threads>").unwrap();
         use commands::CommandPlace::*;
         use commands::FillType::*;
-        println!("{:?}", res.template);
         assert!(res.template == vec![
                 Fixed("./target/release/interdict".to_string()), 
                 Hole("graph".to_string(), Path),
@@ -256,9 +257,23 @@ mod test {
         assert!(res.log_hole == Some(5));
     }
 
-    // #[test]
-    // fn parse_command() {
-        // let (a, b) = cmd_template_parser(b"./target/release/interdict <graph> <epsilon> <delta> foo bar <eta>").unwrap();
-        // panic!();
-    // }
+    #[test]
+    fn cmd_tpl_from_string() {
+        let tpl = CommandTemplate::from_string("./target/release/interdict <graph:path> <epsilon> <delta> --log <log:path> --threads <threads>").unwrap();
+
+        use commands::CommandPlace::*;
+        use commands::FillType::*;
+        assert!(tpl.template == vec![
+                Fixed("./target/release/interdict".to_string()), 
+                Hole("graph".to_string(), Path),
+                Hole("epsilon".to_string(), Literal),
+                Hole("delta".to_string(), Literal),
+                Fixed("--log".to_string()),
+                Hole("log".to_string(), Path),
+                Fixed("--threads".to_string()),
+                Hole("threads".to_string(), Literal),
+        ]);
+
+        assert!(tpl.log_hole == Some(5));
+    }
 }
